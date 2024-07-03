@@ -67,6 +67,11 @@ class GpioLcd:
                 else:
                     self._send(ord(char), True)
 
+def write_lcd(lcd, message):
+    lock = threading.Lock()
+    with lock:
+        lcd.write(message)
+
 def generate_code():
     return f"{random.randint(1000, 9999)}"
 
@@ -81,7 +86,7 @@ def clean_old_wavs(current_wav, new_wav):
         if wav_path not in (current_wav, new_wav):
             os.remove(wav_path)
 
-def speak_code_piper(code_list, last_code, regenerate_event):
+def speak_code_piper(code_list, last_code, regenerate_event, code_accepted_event):
     current_wav = None
     old_wav = None
     ready_event = threading.Event()
@@ -102,7 +107,7 @@ def speak_code_piper(code_list, last_code, regenerate_event):
             current_wav = new_wav_path
             clean_old_wavs(old_wav, current_wav)
 
-        if current_wav and os.path.exists(current_wav):
+        if (not code_accepted_event.is_set()) and current_wav and os.path.exists(current_wav):
             os.system(f"aplay {current_wav}")
         time.sleep(1)
 
@@ -116,7 +121,7 @@ def setup_keypad():
     keypad = adafruit_matrixkeypad.Matrix_Keypad(rows, cols, keys)
     return keypad
 
-def monitor_keypad(keypad, code_list, gpio_pin, lcd, activity_event, phone_off_hook, code_accepted_event, pickup_mode):
+def monitor_keypad(keypad, code_list, gpio_pin, lcd, activity_event, phone_off_hook, code_accepted_event, pickup_mode, new_code_event):
     entered_code = []
     debounce_time = 0.2  # 200 milliseconds debounce time
     last_key_time = time.monotonic()
@@ -133,45 +138,53 @@ def monitor_keypad(keypad, code_list, gpio_pin, lcd, activity_event, phone_off_h
             for key in keys:
                 if key == '*' or key == '#':
                     entered_code = []
-                    lcd.write("Enter Code:")
+                    write_lcd(lcd, "Enter Code:")
                 else:
                     entered_code.append(str(key))
                     if len(entered_code) > 4:
                         entered_code.pop(0)  # Keep only the last 4 keys
                     print("Pressed: ", key)
                     print("Entered code: ", ''.join(entered_code))
-                    lcd.write(f"Enter Code:\n{''.join(entered_code)}")
+                    write_lcd(lcd, f"Enter Code:\n{''.join(entered_code)}")
                     if ''.join(entered_code) in code_list:
                         print("Code accepted")
-                        gpio_pin.value = True  # Set GPIO pin high
-                        lcd.write("Code Accepted")
+                        write_lcd(lcd, "Code Accepted")
+
+                        entered_code = []  # Reset after a correct code is entered
+                        code_list.clear()
+                        clean_old_wavs("","")
+                        new_code_event.set()
+ 
                         code_accepted_event.set()
+                        gpio_pin.value = True  # Set GPIO pin high
                         time.sleep(10)  # Keep it high for 10 seconds
                         gpio_pin.value = False  # Set GPIO pin low
-                        entered_code = []  # Reset after a correct code is entered
-                        code_accepted_event.clear() 
+                        code_accepted_event.clear()
+                        
                         activity_event.set()
-                        pickup_mode.set()
-                        lcd.write("Pick up the\nphone!")
+                        if not phone_off_hook.is_set():
+                            pickup_mode.set()
+                            write_lcd(lcd, "Pick up the\nphone!")
+                        else:
+                            write_lcd(lcd, "Enter Code:\n")
         time.sleep(0.1)
 
-def monitor_mute_button(mute_pin, lcd, activity_event, phone_off_hook, code_accepted_event, pickup_mode):
+def monitor_mute_button(mute_pin, lcd, activity_event, phone_off_hook, pickup_mode, code_accepted_event):
     while True:
         if not mute_pin.value:  # GPIO27 is grounded (phone on hook)
             subprocess.run(["amixer", "-q", "sset", "Master", "Playback", "Switch", "off"])
-            #lcd.write("Pick up the\nphone!")
             activity_event.clear()  # Reset inactivity
             phone_off_hook.clear()  # Indicate the phone is on the hook
         else:
             subprocess.run(["amixer", "-q", "sset", "Master", "Playback", "Switch", "on"])
             phone_off_hook.set()  # Indicate the phone is off the hook
             if not code_accepted_event.is_set() and pickup_mode.is_set():
-                lcd.write("Enter Code:\n")
+                write_lcd(lcd, "Enter Code:\n")
                 pickup_mode.clear()
             activity_event.set()  # Start inactivity timer
         time.sleep(0.1)
 
-def monitor_inactivity(lcd, activity_event, phone_off_hook, code_accepted_event, pickup_mode):
+def monitor_inactivity(lcd, activity_event, phone_off_hook, pickup_mode, code_list, new_code_event):
     while True:
         activity_event.wait()  # Wait until activity is detected
         activity_event.clear()  # Reset the event to start the inactivity timer
@@ -180,9 +193,11 @@ def monitor_inactivity(lcd, activity_event, phone_off_hook, code_accepted_event,
         if not activity_event.wait(30):
             if phone_off_hook.is_set():
                 continue  # Do not change to "Pick up the phone!" if the phone is off the hook
-            lcd.write("Pick up the\nphone!")
-            code_accepted_event.clear()  # Reset code accepted event
-            pickup_mode.set() 
+            write_lcd(lcd, "Pick up the\nphone!")
+            pickup_mode.set()
+            code_list.clear()
+            clean_old_wavs("","")
+            new_code_event.set() 
 
 def main():
     # Setup keypad
@@ -208,27 +223,29 @@ def main():
 
     # Initialize LCD display
     lcd.clear()
-    lcd.write("Pick up the\nphone!")
+    write_lcd(lcd, "Pick up the\nphone!")
 
     # Code list to keep track of the last two codes
-    code_list = [generate_code(), generate_code()]
+    new_code = generate_code()
+    code_list = [new_code, new_code]
     last_code = [""]
     regenerate_event = threading.Event()
     regenerate_event.set()  # Trigger initial WAV generation
-    print(f"Current codes: {code_list}")
+    print(f"Initial codes: {code_list}")
     # Event to monitor activity
     activity_event = threading.Event()
     phone_off_hook = threading.Event()
     pickup_mode = threading.Event() 
     code_accepted_event = threading.Event()
+    new_code_event = threading.Event()
 
     pickup_mode.set()
 
     # Create threads for speaking code, monitoring keypad, and monitoring mute button
-    speech_thread = threading.Thread(target=speak_code_piper, args=(code_list, last_code, regenerate_event))
-    keypad_thread = threading.Thread(target=monitor_keypad, args=(keypad, code_list, gpio_pin, lcd, activity_event, phone_off_hook, code_accepted_event, pickup_mode))
-    mute_thread = threading.Thread(target=monitor_mute_button, args=(mute_pin, lcd, activity_event, phone_off_hook, code_accepted_event, pickup_mode))
-    inactivity_thread = threading.Thread(target=monitor_inactivity, args=(lcd, activity_event, phone_off_hook, code_accepted_event, pickup_mode))
+    speech_thread = threading.Thread(target=speak_code_piper, args=(code_list, last_code, regenerate_event, code_accepted_event))
+    keypad_thread = threading.Thread(target=monitor_keypad, args=(keypad, code_list, gpio_pin, lcd, activity_event, phone_off_hook, code_accepted_event, pickup_mode, new_code_event))
+    mute_thread = threading.Thread(target=monitor_mute_button, args=(mute_pin, lcd, activity_event, phone_off_hook, pickup_mode, code_accepted_event))
+    inactivity_thread = threading.Thread(target=monitor_inactivity, args=(lcd, activity_event, phone_off_hook, pickup_mode, code_list, new_code_event))
 
     # Start threads
     speech_thread.start()
@@ -238,11 +255,15 @@ def main():
 
     # Generate a new code every 60 seconds
     while True:
-        time.sleep(60)
+        #time.sleep(60)
+        new_code_event.wait(60)
+        new_code_event.clear()
         new_code = generate_code()
-        code_list.pop()  # Remove the oldest code
-        code_list.insert(0, new_code)  # Insert the new code at the beginning
-        print(f"New code: {new_code}")
+        while len(code_list) > 1:
+            code_list.pop()  # Remove the oldest code
+        while len(code_list) < 2:
+            code_list.insert(0, new_code)  # Insert the new code at the beginning
+        print(f"New code: {new_code} Code List: {code_list}")
         regenerate_event.set()  # Trigger WAV generation
 
 if __name__ == "__main__":
