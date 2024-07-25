@@ -45,6 +45,7 @@ class GpioLcd:
         self._write_four_bits(data)
 
     def _init_lcd(self):
+        self._send(0x08, False)
         self._send(0x33, False)
         self._send(0x32, False)
         self._send(0x28, False)
